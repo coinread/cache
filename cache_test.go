@@ -311,7 +311,7 @@ var _ = Describe("Codec", func() {
 func newRing() *redis.Ring {
 	return redis.NewRing(&redis.RingOptions{
 		Addrs: map[string]string{
-			"server1": ":6379",
+			"master": "127.0.0.1:36379",
 		},
 	})
 }
