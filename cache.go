@@ -54,7 +54,6 @@ func (tt *TwoTier) Get(key string, target interface{}) error {
 	if err == nil {
 		found = true
 		atomic.AddUint64(&tt.localHits, 1)
-	} else {
 	}
 
 	if !found {
