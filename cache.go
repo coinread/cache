@@ -1,78 +1,31 @@
 package cache
 
 import (
-	"context"
 	"errors"
+	"fmt"
+	"github.com/vmihailenco/msgpack/v4"
 	"sync/atomic"
 	"time"
 
-	"github.com/coinread/twotier-cache/internal"
-	"github.com/coinread/twotier-cache/internal/inmemory"
-	"github.com/coinread/twotier-cache/internal/singleflight"
+	"github.com/coinread/twotier-cache/v8/internal/inmemory"
+	"github.com/coinread/twotier-cache/v8/internal/singleflight"
 
 	"github.com/go-redis/redis/v7"
+	"github.com/hashicorp/go-multierror"
 )
 
 var ErrCacheMiss = errors.New("cache: key is missing")
-var ErrRedisLocalCacheNil = errors.New("cache: both Redis and LocalCache are nil")
-var ErrLocalCacheMissWithOnlyLocalCacheTurnedOn = errors.New("cache: local cache missed, but only local cache mode was on")
-var ErrMarshalSchemaMissing = errors.New("cache: cannot unmarshal, nil provided")
+var ErrNilValueProvided = errors.New("cache: nil value(s) can NOT be stored")
 
-func SetLogger(logger internal.Logger) {
-	internal.Log = logger
-}
-
-type Driver interface {
+type Redis interface {
 	Set(key string, value interface{}, expiration time.Duration) *redis.StatusCmd
 	Get(key string) *redis.StringCmd
 	Del(keys ...string) *redis.IntCmd
 }
 
-type Item struct {
-	Ctx context.Context
-
-	Key    string
-	Object interface{}
-
-	// Func returns object to be cached.
-	Func func() (interface{}, error)
-
-	// Expiration is the cache expiration time.
-	// Default expiration is 1 hour.
-	Expiration time.Duration
-}
-
-func (item *Item) Context() context.Context {
-	if item.Ctx == nil {
-		return context.Background()
-	}
-	return item.Ctx
-}
-
-func (item *Item) object() (interface{}, error) {
-	if item.Object != nil {
-		return item.Object, nil
-	}
-	if item.Func != nil {
-		return item.Func()
-	}
-	return nil, nil
-}
-
-func (item *Item) exp() time.Duration {
-	if item.Expiration < 0 {
-		return 0
-	}
-	if item.Expiration < time.Second {
-		return time.Hour
-	}
-	return item.Expiration
-}
-
-type Codec struct {
-	Redis Driver
-
-	localCache *inmemory.CacheProxy
+type TwoTier struct {
+	R Redis
+	L *inmemory.Cache2Go
 
 	Marshal   func(interface{}) ([]byte, error)
 	Unmarshal func([]byte, interface{}) error
@@ -85,229 +38,6 @@ type Codec struct {
 	localMisses uint64
 }
 
-// UseLocalCache causes Codec to cache items in local LRU cache.
-func (cd *Codec) UseLocalCache(name string) {
-	cd.localCache = inmemory.New(name)
-}
-
-// Set caches the item.
-func (cd *Codec) Set(item *Item) error {
-	obj, err := item.object()
-	if err != nil {
-		return err
-	}
-	_, err = cd.set(item.Context(), item.Key, obj, item.exp())
-	return err
-}
-
-func (cd *Codec) set(ctx context.Context, key string, obj interface{}, exp time.Duration) ([]byte, error) {
-	b, err := cd.Marshal(obj)
-	if err != nil {
-		internal.Log.Printf("cache: Marshal key=%q failed: %s", key, err)
-		return nil, err
-	}
-
-	if cd.localCache != nil {
-		// This means a local cache actually exists.
-		cd.localCache.Set(key, b, exp)
-	}
-
-	if cd.Redis != nil {
-		err = cd.Redis.Set(key, b, exp).Err()
-		if err != nil {
-			internal.Log.Printf("cache: Set key=%q failed: %s", key, err)
-		}
-	} else {
-		if cd.localCache == nil {
-			return nil, ErrRedisLocalCacheNil
-		}
-	}
-
-	return b, err
-}
-
-// Exists reports whether object for the given key exists.
-func (cd *Codec) Exists(key string) bool {
-	return cd.Get(key, nil) == nil
-}
-
-func (cd *Codec) ExistsContext(ctx context.Context, key string) bool {
-	return cd.GetContext(ctx, key, nil) == nil
-}
-
-// Get gets the object for the given key.
-func (cd *Codec) Get(key string, object interface{}) error {
-	return cd.get(context.Background(), key, object, false)
-}
-
-func (cd *Codec) GetContext(ctx context.Context, key string, object interface{}) error {
-	return cd.get(ctx, key, object, false)
-}
-
-func (cd *Codec) get(ctx context.Context, key string, object interface{}, onlyLocalCache bool) error {
-	if object == nil {
-		return ErrMarshalSchemaMissing
-	}
-
-	b, err := cd.getBytes(key, onlyLocalCache)
-	if err != nil {
-		return err
-	}
-
-	err = cd.Unmarshal(b, object)
-	if err != nil {
-		// internal.Log.Printf("cache: key=%q Unmarshal(%T) failed: %s", key, object, err)
-		return err
-	}
-
-	return nil
-}
-
-func (cd *Codec) getBytes(key string, onlyLocalCache bool) ([]byte, error) {
-	var b []byte
-	var err error
-
-	if cd.localCache != nil {
-		b, err = cd.localCache.Get(key)
-		if err != nil {
-			atomic.AddUint64(&cd.localMisses, 1)
-		} else {
-			atomic.AddUint64(&cd.localHits, 1)
-		}
-	}
-
-	if len(b) == 0 && onlyLocalCache {
-		return nil, ErrLocalCacheMissWithOnlyLocalCacheTurnedOn
-	}
-
-	if len(b) == 0 {
-		// Cache miss happened
-		if onlyLocalCache {
-			return nil, ErrLocalCacheMissWithOnlyLocalCacheTurnedOn
-		}
-
-		if cd.Redis == nil {
-			return nil, ErrCacheMiss
-		}
-	}
-
-	b, err = cd.Redis.Get(key).Bytes()
-	if err != nil {
-		atomic.AddUint64(&cd.misses, 1)
-		if err == redis.Nil {
-			return nil, ErrCacheMiss
-		}
-		internal.Log.Printf("cache: Get key=%q failed: %s", key, err)
-		return nil, err
-	}
-	atomic.AddUint64(&cd.hits, 1)
-
-	if cd.localCache != nil {
-		cd.localCache.Set(key, b, 0)
-	}
-
-	return b, nil
-}
-
-// Once gets the item.Object for the given item.Key from the cache or
-// executes, caches, and returns the results of the given item.Func,
-// making sure that only one execution is in-flight for a given item.Key
-// at a time. If a duplicate comes in, the duplicate caller waits for the
-// original to complete and receives the same results.
-func (cd *Codec) Once(item *Item) error {
-	b, cached, err := cd.getSetItemBytesOnce(item)
-	if err != nil {
-		return err
-	}
-
-	if item.Object == nil || len(b) == 0 {
-		return nil
-	}
-
-	err = cd.Unmarshal(b, item.Object)
-	if err != nil {
-		// internal.Log.Printf("cache: key=%q Unmarshal(%T) failed: %s", item.Key, item.Object, err)
-		if cached {
-			_ = cd.Delete(item.Key)
-			return cd.Once(item)
-		}
-		return err
-	}
-
-	return nil
-}
-
-func (cd *Codec) getSetItemBytesOnce(item *Item) (b []byte, cached bool, err error) {
-	if cd.localCache != nil {
-		b, err := cd.getItemBytesFast(item)
-		if err == nil {
-			return b, true, nil
-		}
-	}
-
-	obj, err := cd.group.Do(item.Key, func() (interface{}, error) {
-		b, err := cd.getItemBytes(item)
-		if err == nil {
-			cached = true
-			return b, nil
-		}
-
-		obj, err := item.Func()
-		if err != nil {
-			return nil, err
-		}
-
-		b, err = cd.set(item.Context(), item.Key, obj, item.exp())
-		if b != nil {
-			// Ignore error if we have the result.
-			return b, nil
-		}
-		return nil, err
-	})
-	if err != nil {
-		return nil, false, err
-	}
-	return obj.([]byte), cached, nil
-}
-
-func (cd *Codec) getItemBytes(item *Item) ([]byte, error) {
-	return cd.getBytes(item.Key, false)
-}
-
-func (cd *Codec) getItemBytesFast(item *Item) ([]byte, error) {
-	return cd.getBytes(item.Key, true)
-}
-
-func (cd *Codec) Delete(key string) error {
-	return cd.DeleteContext(context.Background(), key)
-}
-
-func (cd *Codec) DeleteContext(ctx context.Context, key string) error {
-	if cd.localCache != nil {
-		err := cd.localCache.Delete(key)
-		internal.Log.Printf("cache: local del key=%q failed: %s", key, err)
-	}
-
-	if cd.Redis == nil {
-		if cd.localCache == nil {
-			return ErrRedisLocalCacheNil
-		}
-		return nil
-	}
-
-	deleted, err := cd.Redis.Del(key).Result()
-	if err != nil {
-		internal.Log.Printf("cache: Del key=%q failed: %s", key, err)
-		return err
-	}
-	if deleted == 0 {
-		return ErrCacheMiss
-	}
-	return nil
-}
-
-//------------------------------------------------------------------------------
-
 type Stats struct {
 	Hits        uint64
 	Misses      uint64
@@ -315,15 +45,125 @@ type Stats struct {
 	LocalMisses uint64
 }
 
-// Stats returns cache statistics.
-func (cd *Codec) Stats() *Stats {
-	stats := Stats{
-		Hits:   atomic.LoadUint64(&cd.hits),
-		Misses: atomic.LoadUint64(&cd.misses),
+func (tt *TwoTier) Get(key string, target interface{}) error {
+	var found bool
+	var b []byte
+	var err error
+
+	b, err = tt.L.Get(key)
+	if err == nil {
+		found = true
+		atomic.AddUint64(&tt.localHits, 1)
+	} else {
+		atomic.AddUint64(&tt.localMisses, 1)
 	}
-	if cd.localCache != nil {
-		stats.LocalHits = atomic.LoadUint64(&cd.localHits)
-		stats.LocalMisses = atomic.LoadUint64(&cd.localMisses)
+
+	if !found {
+		b, err = tt.R.Get(key).Bytes()
+		if err == nil {
+			found = true
+			atomic.AddUint64(&tt.hits, 1)
+		} else {
+			atomic.AddUint64(&tt.misses, 1)
+		}
 	}
-	return &stats
+
+	if !found {
+		return ErrCacheMiss
+	}
+
+	// In here, we are guaranteed to have it, one way or another
+	// Just unmarshal and hand it over
+	err = tt.Unmarshal(b, target)
+	if err != nil {
+		fmt.Printf("cache: key=%q Unmarshal(%T) failed: %s", key, target, err)
+		_ = tt.Delete(key)
+		return err
+	}
+
+	return nil
+}
+
+func (tt *TwoTier) Exists(key string) bool {
+	// No need to go check redis, two implementations share the expiry guarantees
+	return tt.L.Exists(key)
+}
+
+func (tt *TwoTier) Set(key string, expiresIn time.Duration, generator func() (interface{}, error)) (interface{}, error) {
+	return tt.group.Do(key, func() (interface{}, error) {
+		generated, err := generator()
+		if err != nil {
+			return nil, err
+		}
+
+		if generated == nil {
+			return nil, ErrNilValueProvided
+		}
+
+		b, err := tt.Marshal(generated)
+		if err != nil {
+			return nil, err
+		}
+
+		// Let's set it to both the local cache and redis
+		tt.L.Set(key, b, expiresIn)
+		err = tt.R.Set(key, b, expiresIn).Err()
+		if err != nil {
+			return nil, err
+		}
+
+		return generated, nil
+	})
+}
+
+// Funny implementation
+func (tt *TwoTier) SetStatic(key string, expiresIn time.Duration, value interface{}) error {
+	_, err := tt.Set(key, expiresIn, func() (interface{}, error) {
+		return value, nil
+	})
+
+	return err
+}
+
+func (tt *TwoTier) Delete(key string) error {
+	var out error
+
+	err := tt.L.Delete(key)
+	if err != nil {
+		out = multierror.Append(out, err)
+	}
+
+	err = tt.R.Del(key).Err()
+	if err != nil {
+		out = multierror.Append(out, err)
+	}
+
+	return out
+}
+
+func (tt *TwoTier) Stats() Stats {
+	return Stats{
+		Hits:        atomic.LoadUint64(&tt.hits),
+		Misses:      atomic.LoadUint64(&tt.misses),
+		LocalHits:   atomic.LoadUint64(&tt.localHits),
+		LocalMisses: atomic.LoadUint64(&tt.localMisses),
+	}
+}
+
+func New(redis Redis) *TwoTier {
+	return &TwoTier{
+		R: redis,
+		L: inmemory.New("internal", time.Minute),
+		Marshal: func(v interface{}) ([]byte, error) {
+			return msgpack.Marshal(v)
+		},
+		Unmarshal: func(b []byte, v interface{}) error {
+			return msgpack.Unmarshal(b, v)
+		},
+		group:       singleflight.Group{},
+		hits:        0,
+		misses:      0,
+		localHits:   0,
+		localMisses: 0,
+	}
 }

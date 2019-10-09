@@ -8,7 +8,7 @@
 go-redis/cache requires a Go version with [Modules](https://github.com/golang/go/wiki/Modules) support and uses import versioning. So please make sure to initialize a Go module before installation:
 
 ```shell
-go get -u github.com/go-redis/cache/v7
+go get -u github.com/coinread/twotier-cache/v8
 ```
 
 ## Quickstart
@@ -24,7 +24,7 @@ import (
 	"github.com/go-redis/redis/v7"
 	"github.com/vmihailenco/msgpack/v4"
 
-	"github.com/go-redis/cache/v7"
+	"github.com/coinread/twotier-cache/v8"
 )
 
 type Object struct {
