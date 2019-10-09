@@ -21,6 +21,7 @@ type Redis interface {
 	Set(key string, value interface{}, expiration time.Duration) *redis.StatusCmd
 	Get(key string) *redis.StringCmd
 	Del(keys ...string) *redis.IntCmd
+	PTTL(key string) *redis.DurationCmd
 }
 
 type TwoTier struct {
@@ -50,25 +51,38 @@ func (tt *TwoTier) Get(key string, target interface{}) error {
 	var b []byte
 	var err error
 
-	b, err = tt.L.Get(key)
-	if err == nil {
-		found = true
-		atomic.AddUint64(&tt.localHits, 1)
+	if tt.L != nil {
+		b, err = tt.L.Get(key)
+		if err == nil {
+			found = true
+			atomic.AddUint64(&tt.localHits, 1)
+		}
 	}
 
 	if !found {
 		atomic.AddUint64(&tt.localMisses, 1)
-		b, err = tt.R.Get(key).Bytes()
-		if err == nil {
-			found = true
-			atomic.AddUint64(&tt.hits, 1)
 
-			// Set this back into the local cache since we somehow found an out of sync record.
-			tt.L.Set(key, b, 0)
-		} else {
-			atomic.AddUint64(&tt.misses, 1)
-			return ErrCacheMiss
+		if tt.R != nil {
+			b, err = tt.R.Get(key).Bytes()
+			if err == nil {
+				found = true
+				atomic.AddUint64(&tt.hits, 1)
+
+				// Set this back into the local cache since we somehow found an out of sync record.
+				tt.syncLocalFromRedis(key, b)
+			} else {
+				atomic.AddUint64(&tt.misses, 1)
+			}
 		}
+	}
+
+	if !found {
+		return ErrCacheMiss
+	}
+
+	// This is to facilitate existence checking
+	if target == nil {
+		return nil
 	}
 
 	// In here, we are guaranteed to have it, one way or another
@@ -83,14 +97,24 @@ func (tt *TwoTier) Get(key string, target interface{}) error {
 	return nil
 }
 
-func (tt *TwoTier) Exists(key string) bool {
-	// No need to go check redis, two implementations share the expiry guarantees
-	return tt.L.Exists(key)
+func (tt *TwoTier) syncLocalFromRedis(key string, value []byte) {
+	ttl, err := tt.R.PTTL(key).Result()
+	if err != nil {
+		return
+	}
+
+	if tt.L != nil {
+		tt.L.Set(key, value, ttl)
+	}
 }
 
-func (tt *TwoTier) Set(key string, expiresIn time.Duration, generator func() (interface{}, error)) (interface{}, error) {
+func (tt *TwoTier) Exists(key string) bool {
+	return tt.Get(key, nil) == nil
+}
+
+func (tt *TwoTier) Set(key string, expiresIn time.Duration, cb func() (interface{}, error)) (interface{}, error) {
 	return tt.group.Do(key, func() (interface{}, error) {
-		generated, err := generator()
+		generated, err := cb()
 		if err != nil {
 			return nil, err
 		}
@@ -105,10 +129,15 @@ func (tt *TwoTier) Set(key string, expiresIn time.Duration, generator func() (in
 		}
 
 		// Let's set it to both the local cache and redis
-		tt.L.Set(key, b, expiresIn)
-		err = tt.R.Set(key, b, expiresIn).Err()
-		if err != nil {
-			return nil, err
+		if tt.L != nil {
+			tt.L.Set(key, b, expiresIn)
+		}
+
+		if tt.R != nil {
+			err = tt.R.Set(key, b, expiresIn).Err()
+			if err != nil {
+				return nil, err
+			}
 		}
 
 		return generated, nil
@@ -127,14 +156,18 @@ func (tt *TwoTier) SetStatic(key string, expiresIn time.Duration, value interfac
 func (tt *TwoTier) Delete(key string) error {
 	var out error
 
-	err := tt.L.Delete(key)
-	if err != nil {
-		out = multierror.Append(out, err)
+	if tt.L != nil {
+		err := tt.L.Delete(key)
+		if err != nil {
+			out = multierror.Append(out, err)
+		}
 	}
 
-	err = tt.R.Del(key).Err()
-	if err != nil {
-		out = multierror.Append(out, err)
+	if tt.R != nil {
+		err := tt.R.Del(key).Err()
+		if err != nil {
+			out = multierror.Append(out, err)
+		}
 	}
 
 	return out
@@ -149,20 +182,21 @@ func (tt *TwoTier) Stats() Stats {
 	}
 }
 
-func New(redis Redis) *TwoTier {
+func (tt *TwoTier) UseLocalCache(name string, defaultExpiry time.Duration) {
+	tt.L = inmemory.New(name, defaultExpiry)
+}
+
+func (tt *TwoTier) UseRedisCache(redis Redis) {
+	tt.R = redis
+}
+
+func New() *TwoTier {
 	return &TwoTier{
-		R: redis,
-		L: inmemory.New("internal", time.Minute),
 		Marshal: func(v interface{}) ([]byte, error) {
 			return msgpack.Marshal(v)
 		},
 		Unmarshal: func(b []byte, v interface{}) error {
 			return msgpack.Unmarshal(b, v)
 		},
-		group:       singleflight.Group{},
-		hits:        0,
-		misses:      0,
-		localHits:   0,
-		localMisses: 0,
 	}
 }

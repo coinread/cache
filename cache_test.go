@@ -84,7 +84,7 @@ var _ = Describe("Codec", func() {
 			Expect(codec.Exists(key)).To(BeTrue())
 		})
 
-		Describe("Once func", func() {
+		Describe("Set func", func() {
 			It("calls Func when cache fails", func() {
 				key := "cFwcf"
 				err := codec.SetStatic(key, time.Hour, "*")
@@ -119,7 +119,8 @@ var _ = Describe("Codec", func() {
 				})
 
 				var got bool
-				err := codec.Get(key, &got)
+				// 1 to not crash with the above perform call
+				err := codec.Get(key+"1", &got)
 				Expect(err).To(Equal(cache.ErrCacheMiss))
 
 				val, err := codec.Set(key, time.Hour, func() (interface{}, error) {
@@ -135,6 +136,7 @@ var _ = Describe("Codec", func() {
 				var callCount int64
 				perform(100, func(int) {
 					val, err := codec.Set(key, time.Hour, func() (interface{}, error) {
+						time.Sleep(15 * time.Millisecond)
 						atomic.AddInt64(&callCount, 1)
 						return obj, nil
 					})
@@ -150,6 +152,7 @@ var _ = Describe("Codec", func() {
 				var callCount int64
 				perform(100, func(int) {
 					val, err := codec.Set(key, time.Hour, func() (interface{}, error) {
+						time.Sleep(15 * time.Millisecond)
 						atomic.AddInt64(&callCount, 1)
 						return *obj, nil
 					})
@@ -165,6 +168,7 @@ var _ = Describe("Codec", func() {
 				var callCount int64
 				perform(100, func(int) {
 					val, err := codec.Set(key, time.Hour, func() (interface{}, error) {
+						time.Sleep(15 * time.Millisecond)
 						atomic.AddInt64(&callCount, 1)
 						return true, nil
 					})
@@ -216,7 +220,7 @@ var _ = Describe("Codec", func() {
 				})
 
 				perform(100, func(int) {
-					n, err := do(0)
+					n, err := do(15 * time.Millisecond)
 					Expect(err).NotTo(HaveOccurred())
 					Expect(n).To(Equal(42))
 				})
@@ -233,9 +237,29 @@ var _ = Describe("Codec", func() {
 		}
 	})
 
-	Context("L + R", func() {
+	Context("with Local Cache Only", func() {
 		BeforeEach(func() {
-			codec = newTieredCache()
+			codec = cache.New()
+			codec.UseLocalCache("internal", time.Minute)
+		})
+
+		testCodec()
+	})
+
+	Context("with Redis Cache Only", func() {
+		BeforeEach(func() {
+			codec = cache.New()
+			codec.UseRedisCache(newRing())
+		})
+
+		testCodec()
+	})
+
+	Context("with Tiered Cache (Local + Redis)", func() {
+		BeforeEach(func() {
+			codec = cache.New()
+			codec.UseRedisCache(newRing())
+			codec.UseLocalCache("internal", time.Minute)
 		})
 
 		testCodec()
@@ -243,18 +267,23 @@ var _ = Describe("Codec", func() {
 })
 
 func newRing() *redis.Ring {
-	return redis.NewRing(&redis.RingOptions{
+	ring := redis.NewRing(&redis.RingOptions{
 		Addrs: map[string]string{
 			"master": "127.0.0.1:6379",
 		},
 	})
-}
 
-func newTieredCache() *cache.TwoTier {
-	ring := newRing()
 	_ = ring.ForEachShard(func(client *redis.Client) error {
 		return client.FlushDB().Err()
 	})
 
-	return cache.New(ring)
+	return ring
+}
+
+func newTieredCache() *cache.TwoTier {
+	tier := cache.New()
+	tier.UseRedisCache(newRing())
+	tier.UseLocalCache("internal", time.Minute)
+
+	return tier
 }
