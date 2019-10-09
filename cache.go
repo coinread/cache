@@ -55,21 +55,18 @@ func (tt *TwoTier) Get(key string, target interface{}) error {
 		found = true
 		atomic.AddUint64(&tt.localHits, 1)
 	} else {
-		atomic.AddUint64(&tt.localMisses, 1)
 	}
 
 	if !found {
+		atomic.AddUint64(&tt.localMisses, 1)
 		b, err = tt.R.Get(key).Bytes()
 		if err == nil {
 			found = true
 			atomic.AddUint64(&tt.hits, 1)
 		} else {
 			atomic.AddUint64(&tt.misses, 1)
+			return ErrCacheMiss
 		}
-	}
-
-	if !found {
-		return ErrCacheMiss
 	}
 
 	// In here, we are guaranteed to have it, one way or another
