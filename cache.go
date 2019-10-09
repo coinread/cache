@@ -62,6 +62,9 @@ func (tt *TwoTier) Get(key string, target interface{}) error {
 		if err == nil {
 			found = true
 			atomic.AddUint64(&tt.hits, 1)
+
+			// Set this back into the local cache since we somehow found an out of sync record.
+			tt.L.Set(key, b, 0)
 		} else {
 			atomic.AddUint64(&tt.misses, 1)
 			return ErrCacheMiss
